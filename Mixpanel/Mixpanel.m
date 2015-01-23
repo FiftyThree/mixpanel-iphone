@@ -45,6 +45,7 @@
 @property (nonatomic, strong) NSMutableArray *eventsQueue;
 @property (nonatomic, strong) NSMutableArray *peopleQueue;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier taskId;
+@property (nonatomic) NSString *serialQueueLabel;
 @property (nonatomic, strong) dispatch_queue_t serialQueue;
 @property (nonatomic, assign) SCNetworkReachabilityRef reachability;
 @property (nonatomic, strong) CTTelephonyNetworkInfo *telephonyInfo;
@@ -158,8 +159,9 @@ static Mixpanel *sharedInstance = nil;
         self.eventsQueue = [NSMutableArray array];
         self.peopleQueue = [NSMutableArray array];
         self.taskId = UIBackgroundTaskInvalid;
-        NSString *label = [NSString stringWithFormat:@"com.mixpanel.%@.%p", apiToken, self];
-        self.serialQueue = dispatch_queue_create([label UTF8String], DISPATCH_QUEUE_SERIAL);
+        self.serialQueueLabel = [NSString stringWithFormat:@"com.mixpanel.%@.%p", apiToken, self];
+        self.serialQueue = dispatch_queue_create([self.serialQueueLabel UTF8String], DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_set_specific(self.serialQueue, (const void *)[self.serialQueueLabel UTF8String], (void *)[self.serialQueueLabel UTF8String], NULL);
         self.dateFormatter = [[NSDateFormatter alloc] init];
         [_dateFormatter setDateFormat:@"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"];
         [_dateFormatter setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"UTC"]];
@@ -1005,10 +1007,13 @@ static Mixpanel *sharedInstance = nil;
                 [self showSurveyWithObject:surveys[0] withAlert:([start timeIntervalSinceNow] < -2.0)];
             }
 
+            for (MPVariant *variant in variants) {
+                [self markVariantRun:variant];
+            }
+
             dispatch_sync(dispatch_get_main_queue(), ^{
                 for (MPVariant *variant in variants) {
                     [variant execute];
-                    [self markVariantRun:variant];
                 }
             });
 
@@ -1687,6 +1692,12 @@ static Mixpanel *sharedInstance = nil;
 
 - (void)markVariantRun:(MPVariant *)variant
 {
+    if (!dispatch_get_specific((const void *)[self.serialQueueLabel UTF8String]))
+    {
+        NSAssert(false, @"markVariantRun must be executed via serialQueue");
+        return;
+    }
+    
     MixpanelDebug(@"%@ marking variant %@ shown for experiment %@", self, @(variant.ID), @(variant.experimentID));
     NSDictionary *shownVariant = @{[@(variant.experimentID) stringValue]: @(variant.ID)};
     [self track:@"$experiment_started" properties:@{@"$experiment_id" : @(variant.experimentID), @"$variant_id": @(variant.ID)}];
@@ -1694,16 +1705,17 @@ static Mixpanel *sharedInstance = nil;
         [self.people merge:@{@"$experiments": shownVariant}];
     }
 
-    dispatch_async(self.serialQueue, ^{
-        NSMutableDictionary *superProperties = [NSMutableDictionary dictionaryWithDictionary:self.superProperties];
-        NSMutableDictionary *shownVariants = [NSMutableDictionary dictionaryWithDictionary: superProperties[@"$experiments"]];
-        [shownVariants addEntriesFromDictionary:shownVariant];
-        [superProperties addEntriesFromDictionary:@{@"$experiments": [shownVariants copy]}];
-        self.superProperties = [superProperties copy];
-        if ([Mixpanel inBackground]) {
-            [self archiveProperties];
-        }
-    });
+    // Write the variant to $experiments super property immediately, not queued to the end of the serialQueue.
+    // This ensures that all pending events, which were queued after the decide check was queued, will have
+    // the appropriate $experiments super property applied.
+    NSMutableDictionary *superProperties = [NSMutableDictionary dictionaryWithDictionary:self.superProperties];
+    NSMutableDictionary *shownVariants = [NSMutableDictionary dictionaryWithDictionary: superProperties[@"$experiments"]];
+    [shownVariants addEntriesFromDictionary:shownVariant];
+    [superProperties addEntriesFromDictionary:@{@"$experiments": [shownVariants copy]}];
+    self.superProperties = [superProperties copy];
+    if ([Mixpanel inBackground]) {
+        [self archiveProperties];
+    }
 }
 
 - (void)joinExperiments
